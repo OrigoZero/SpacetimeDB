@@ -57,6 +57,12 @@ tokio-tungstenite-wasm = { version = "0.6.0", optional = true }
 wasm-bindgen = { version = "0.2.100", optional = true }
 wasm-bindgen-futures = { version = "0.4.45", optional = true }
 web-sys = { version = "0.3.77", features = ["HtmlDocument"], optional = true }
+# The Zero engine's clock (`zero_time::current_epoch_ns`), which stamps a
+# reducer call the connection ended before sending (src/db_connection.rs) on
+# native and wasm alike. The engine supplies it through its own
+# `[patch.crates-io]`, and this workspace's root manifest supplies it from the
+# engine's repository.
+zero_time = "0.1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 home.workspace = true

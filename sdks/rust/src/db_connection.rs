@@ -360,6 +360,44 @@ impl<M: SpacetimeModule> DbContextImpl<M> {
         Ctx::new(imp, event)
     }
 
+    /// Hand `msg` to the WebSocket loop. Returns `false` when the loop can no
+    /// longer take it: a disconnect was requested or the connection has ended
+    /// (`send_chan` is `None`), or the WebSocket loop has exited and dropped
+    /// its receiver. In each case the WebSocket loop has stopped, or is
+    /// stopping, and its end reaches the loop advancing this connection when
+    /// `recv` delivers the terminal error or closes; `end_connection` then
+    /// hands that error to `on_disconnect`. `what` names the message in the log.
+    fn send_to_ws_loop(&self, what: &str, msg: ws::v2::ClientMessage) -> bool {
+        let sent = match self.send_chan.lock().unwrap().as_mut() {
+            Some(chan) => chan.unbounded_send(msg).is_ok(),
+            None => false,
+        };
+        if !sent {
+            self.debug_log(|out| writeln!(out, "`send_to_ws_loop`: the connection ended before the {what} was sent"));
+            log::warn!("The connection ended before the {what} was sent");
+        }
+        sent
+    }
+
+    /// Answer the reducer call stored under `request_id`, which the
+    /// connection ended before sending, with an error saying so.
+    fn fail_unsent_reducer_call(&self, request_id: u32, reducer_name: &str) {
+        let call = self.inner.lock().unwrap().reducer_callbacks.pop_call_info(request_id);
+        let Some((reducer, callback)) = call else {
+            return;
+        };
+        let error = unsent_call_error("reducer", reducer_name);
+        let reducer_event = ReducerEvent {
+            reducer,
+            // The client's clock at the moment the call was given up, in
+            // place of the server's clock at the reducer's run.
+            timestamp: Timestamp::from_micros_since_unix_epoch((zero_time::current_epoch_ns() / 1_000) as i64),
+            status: Status::Panic(error.clone()),
+        };
+        let reducer_event_ctx = self.make_event_ctx(reducer_event);
+        callback(&reducer_event_ctx, Err(error));
+    }
+
     /// Apply all queued [`PendingMutation`]s.
     fn apply_pending_mutations(&self) -> crate::Result<()> {
         while let Ok(Some(pending_mutation)) = get_lock_sync(&self.pending_mutations_recv).try_next() {
@@ -380,13 +418,9 @@ impl<M: SpacetimeModule> DbContextImpl<M> {
                 // Register the subscription, so we can handle related messages from the server.
                 inner.subscriptions.register_subscription(query_set_id, handle.clone());
                 if let Some(msg) = handle.start() {
-                    self.send_chan
-                        .lock()
-                        .unwrap()
-                        .as_mut()
-                        .ok_or(crate::Error::Disconnected)?
-                        .unbounded_send(ws::v2::ClientMessage::Subscribe(msg))
-                        .expect("Unable to send subscribe message: WS sender loop has dropped its recv channel");
+                    // A subscription the connection ended before sending
+                    // ends with the connection, through `on_disconnect`.
+                    self.send_to_ws_loop("subscribe message", ws::v2::ClientMessage::Subscribe(msg));
                 }
                 // else, the handle was already cancelled.
             }
@@ -404,13 +438,9 @@ impl<M: SpacetimeModule> DbContextImpl<M> {
                         callback(&self.make_event_ctx(()));
                     }
                     PendingUnsubscribeResult::SendUnsubscribe(m) => {
-                        self.send_chan
-                            .lock()
-                            .unwrap()
-                            .as_mut()
-                            .ok_or(crate::Error::Disconnected)?
-                            .unbounded_send(ws::v2::ClientMessage::Unsubscribe(m))
-                            .expect("Unable to send unsubscribe message: WS sender loop has dropped its recv channel");
+                        // An unsubscribe the connection ended before sending
+                        // ends with the connection, through `on_disconnect`.
+                        self.send_to_ws_loop("unsubscribe message", ws::v2::ClientMessage::Unsubscribe(m));
                     }
                 }
             }
@@ -437,13 +467,9 @@ impl<M: SpacetimeModule> DbContextImpl<M> {
                     request_id,
                     flags,
                 });
-                self.send_chan
-                    .lock()
-                    .unwrap()
-                    .as_mut()
-                    .ok_or(crate::Error::Disconnected)?
-                    .unbounded_send(msg)
-                    .expect("Unable to send reducer call message: WS sender loop has dropped its recv channel");
+                if !self.send_to_ws_loop("reducer call", msg) {
+                    self.fail_unsent_reducer_call(request_id, reducer_name);
+                }
             }
 
             // Invoke a procedure: stash its callback, then send the `CallProcedure` WS message.
@@ -466,13 +492,15 @@ impl<M: SpacetimeModule> DbContextImpl<M> {
                     request_id,
                     flags: ws::v2::CallProcedureFlags::Default,
                 });
-                self.send_chan
-                    .lock()
-                    .unwrap()
-                    .as_mut()
-                    .ok_or(crate::Error::Disconnected)?
-                    .unbounded_send(msg)
-                    .expect("Unable to send procedure call message: WS sender loop has dropped its recv channel");
+                if !self.send_to_ws_loop("procedure call", msg) {
+                    let error = unsent_call_error("procedure", procedure);
+                    let ctx = self.make_event_ctx(());
+                    self.inner
+                        .lock()
+                        .unwrap()
+                        .procedure_callbacks
+                        .resolve(&ctx, request_id, Err(error));
+                }
             }
 
             // Disconnect: close the connection.
@@ -1618,6 +1646,14 @@ impl<M: SpacetimeModule> std::fmt::Debug for PendingMutation<M> {
 enum Message<M: SpacetimeModule> {
     Ws(Option<ParsedMessage<M>>),
     Local(PendingMutation<M>),
+}
+
+/// The error a call receives when the connection ended before the call was
+/// sent to the server.
+fn unsent_call_error(kind: &str, name: &str) -> InternalError {
+    InternalError::new(format!(
+        "The connection ended before the call to {kind} `{name}` was sent"
+    ))
 }
 
 fn error_is_normal_disconnect(e: &crate::Error) -> bool {
