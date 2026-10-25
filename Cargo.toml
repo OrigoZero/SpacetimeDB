@@ -405,3 +405,10 @@ result_large_err = "allow"
 # This silences a warning in our Nix flake, which otherwise would be upset that our call to `crateNameFromCargoToml`
 # is running against a file that doesn't have a name in it.
 crane.name = "spacetimedb"
+
+# `spacetimedb-sdk` names the Zero engine's clock crate, `zero_time`
+# (sdks/rust/Cargo.toml), which the engine's repository holds rather than a
+# registry; this entry resolves it there for a build of this workspace. A
+# build of the engine supplies it from the engine's own workspace instead.
+[patch.crates-io]
+zero_time = { git = "ssh://git@github.com/OrigoZero/zero.git", branch = "main" }
