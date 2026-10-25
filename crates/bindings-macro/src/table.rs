@@ -1014,8 +1014,12 @@ pub(crate) fn table_impl(mut args: TableArgs, item: &syn::DeriveInput) -> syn::R
                 let ty = &col.ty;
                 let ident_span = col.ident.span();
                 Some(quote_spanned! { ident_span =>
-                    // This closure enforces that `val` is of type `ty` at compile-time.
-                    let _check: #ty = #val;
+                    // This binding enforces that `val` is of type `ty` at
+                    // compile-time. `ManuallyDrop` keeps the check from
+                    // running `ty`'s destructor in the const block, so a type
+                    // with a destructor (a `String`) takes a const default
+                    // (`String::new()`).
+                    let _check = ::core::mem::ManuallyDrop::<#ty>::new(#val);
                 })
             } else {
                 None
