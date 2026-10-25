@@ -40,6 +40,33 @@ use crate::compression::decompress_server_message;
 use crate::db_connection::debug_log;
 use crate::metrics::CLIENT_METRICS;
 
+/// A binary frame from the server that did not decode into a server message.
+///
+/// The frame may have been the reply to any outstanding request, and the
+/// client cannot tell which, so the connection ends on it: the message loop
+/// hands it to the parse loop and stops reading, and the parse loop reports it
+/// as the connection's terminal error, which reaches `on_disconnect`.
+#[derive(Debug, Clone)]
+pub(crate) struct UndecodableServerMessage {
+    /// The frame's length in bytes, as it arrived.
+    pub(crate) len: usize,
+    /// Why it did not decompress or deserialize.
+    pub(crate) error: String,
+}
+
+impl std::fmt::Display for UndecodableServerMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the server sent a {}-byte message this client could not decode ({}), and the connection ended on it",
+            self.len, self.error
+        )
+    }
+}
+
+/// What the message loop hands the parse loop for each binary frame.
+pub(crate) type RawServerMessage = Result<ws::v2::ServerMessage, UndecodableServerMessage>;
+
 #[cfg(not(feature = "browser"))]
 type TokioTungsteniteError = tokio_tungstenite::tungstenite::Error;
 #[cfg(feature = "browser")]
@@ -386,6 +413,15 @@ impl WsConnection {
         bsatn::from_slice(bytes).map_err(|source| WsError::DeserializeMessage { source })
     }
 
+    /// Decode one binary frame into what the message loop hands the parse loop:
+    /// the server message, or the frame's length and why it did not decode.
+    pub(crate) fn decode_frame(bytes: &[u8]) -> RawServerMessage {
+        Self::parse_response(bytes).map_err(|e| UndecodableServerMessage {
+            len: bytes.len(),
+            error: e.to_string(),
+        })
+    }
+
     pub(crate) fn encode_message(msg: ws::v2::ClientMessage) -> WebSocketMessage {
         WebSocketMessage::Binary(bsatn::to_vec(&msg).unwrap().into())
     }
@@ -393,7 +429,7 @@ impl WsConnection {
     #[cfg(not(feature = "browser"))]
     async fn message_loop(
         mut self,
-        incoming_messages: mpsc::UnboundedSender<ws::v2::ServerMessage>,
+        incoming_messages: mpsc::UnboundedSender<RawServerMessage>,
         outgoing_messages: mpsc::UnboundedReceiver<ws::v2::ClientMessage>,
         extra_logging: Option<Arc<Mutex<File>>>,
     ) {
@@ -459,16 +495,20 @@ impl WsConnection {
                     Ok(Some(WebSocketMessage::Binary(bytes))) => {
                         idle = false;
                         record_metrics(bytes.len());
-                        match Self::parse_response(&bytes) {
-                            Err(e) => maybe_log_error!(
-                                &extra_logging,
-                                "Error decoding WebSocketMessage::Binary payload",
-                                Result::<(), _>::Err(e)
-                            ),
+                        match Self::decode_frame(&bytes) {
+                            Err(undecodable) => {
+                                log::error!("{undecodable}");
+                                maybe_log_error!(
+                                    &extra_logging,
+                                    "Error sending undecodable message to incoming_messages queue",
+                                    incoming_messages.unbounded_send(Err(undecodable))
+                                );
+                                break;
+                            }
                             Ok(msg) => maybe_log_error!(
                                 &extra_logging,
                                 "Error sending decoded message to incoming_messages queue",
-                                incoming_messages.unbounded_send(msg)
+                                incoming_messages.unbounded_send(Ok(msg))
                             ),
                         }
                     }
@@ -543,7 +583,7 @@ impl WsConnection {
         extra_logging: Option<Arc<Mutex<File>>>,
     ) -> (
         JoinHandle<()>,
-        mpsc::UnboundedReceiver<ws::v2::ServerMessage>,
+        mpsc::UnboundedReceiver<RawServerMessage>,
         mpsc::UnboundedSender<ws::v2::ClientMessage>,
     ) {
         let (outgoing_send, outgoing_recv) = mpsc::unbounded();
@@ -556,7 +596,7 @@ impl WsConnection {
     pub(crate) fn spawn_message_loop(
         self,
     ) -> (
-        mpsc::UnboundedReceiver<ws::v2::ServerMessage>,
+        mpsc::UnboundedReceiver<RawServerMessage>,
         mpsc::UnboundedSender<ws::v2::ClientMessage>,
     ) {
         let websocket_received = CLIENT_METRICS.websocket_received.with_label_values(&self.db_name);
@@ -569,7 +609,7 @@ impl WsConnection {
         };
 
         let (outgoing_tx, outgoing_rx) = mpsc::unbounded::<ws::v2::ClientMessage>();
-        let (incoming_tx, incoming_rx) = mpsc::unbounded::<ws::v2::ServerMessage>();
+        let (incoming_tx, incoming_rx) = mpsc::unbounded::<RawServerMessage>();
 
         let (mut ws_writer, ws_reader) = self.sock.split();
 
@@ -589,16 +629,15 @@ impl WsConnection {
                         Some(Ok(WebSocketMessage::Binary(bytes))) => {
                             record_metrics(bytes.len());
                             // parse + forward into `incoming_tx`
-                            match Self::parse_response(&bytes) {
-                                Ok(msg) => if let Err(_e) = incoming_tx.unbounded_send(msg) {
+                            match Self::decode_frame(&bytes) {
+                                Ok(msg) => if let Err(_e) = incoming_tx.unbounded_send(Ok(msg)) {
                                     gloo_console::warn!("Incoming receiver dropped.");
                                     break;
                                 },
-                                Err(e) => {
-                                    gloo_console::warn!(
-                                        "Error decoding WebSocketMessage::Binay payload: ",
-                                        format!("{:?}", e)
-                                    );
+                                Err(undecodable) => {
+                                    gloo_console::error!(undecodable.to_string());
+                                    let _ = incoming_tx.unbounded_send(Err(undecodable));
+                                    break;
                                 },
                             }
                         },
