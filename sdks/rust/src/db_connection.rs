@@ -310,6 +310,9 @@ impl<M: SpacetimeModule> DbContextImpl<M> {
         let event = get_event(&mut inner);
         let row_event_ctx = self.make_event_ctx(event);
         applied_diff.invoke_row_callbacks(&row_event_ctx, &mut inner.db_callbacks);
+        if let Some(callback) = &mut inner.on_transaction_applied {
+            callback(&row_event_ctx);
+        }
     }
 
     /// Mark the connection lifecycle as ended, route the terminal event to the
@@ -840,6 +843,7 @@ impl<M: SpacetimeModule> DbContextImpl<M> {
 }
 
 type OnConnectCallback<M> = Box<dyn FnOnce(&<M as SpacetimeModule>::DbConnection, Identity, &str) + Send + 'static>;
+type OnTransactionAppliedCallback<M> = Box<dyn FnMut(&<M as SpacetimeModule>::EventContext) + Send + 'static>;
 
 type OnConnectErrorCallback<M> = Box<dyn FnOnce(&<M as SpacetimeModule>::ErrorContext, crate::Error) + Send + 'static>;
 
@@ -869,6 +873,7 @@ pub(crate) struct DbContextImplInner<M: SpacetimeModule> {
     pub(crate) subscriptions: SubscriptionManager<M>,
 
     connection_lifecycle: ConnectionLifecycle,
+    on_transaction_applied: Option<OnTransactionAppliedCallback<M>>,
     on_connect: Option<OnConnectCallback<M>>,
     on_connect_error: Option<OnConnectErrorCallback<M>>,
     on_disconnect: Option<OnDisconnectCallback<M>>,
@@ -883,6 +888,7 @@ pub(crate) struct DbContextImplInner<M: SpacetimeModule> {
 /// Get a builder by calling `DbConnection::builder()`.
 // TODO: Move into its own module which is not #[doc(hidden)]?
 pub struct DbConnectionBuilder<M: SpacetimeModule> {
+    on_transaction_applied: Option<OnTransactionAppliedCallback<M>>,
     uri: Option<Uri>,
 
     database_name: Option<String>,
@@ -945,6 +951,7 @@ impl<M: SpacetimeModule> DbConnectionBuilder<M> {
     #[doc(hidden)]
     pub fn new() -> Self {
         Self {
+            on_transaction_applied: None,
             uri: None,
             database_name: None,
             token: None,
@@ -1033,7 +1040,7 @@ but you must call one of them, or else the connection will never progress.
         let (pending_mutations_send, pending_mutations_recv) = mpsc::unbounded();
         let pending_mutations_recv = Arc::new(TokioMutex::new(pending_mutations_recv));
 
-        let inner_ctx = build_db_ctx_inner(runtime, self.on_connect, self.on_connect_error, self.on_disconnect);
+        let inner_ctx = build_db_ctx_inner(runtime, self.on_connect, self.on_connect_error, self.on_disconnect, self.on_transaction_applied);
         Ok(build_db_ctx(
             handle,
             inner_ctx,
@@ -1077,7 +1084,7 @@ but you must call one of them, or else the connection will never progress.
         let (pending_mutations_send, pending_mutations_recv) = mpsc::unbounded();
         let pending_mutations_recv = Arc::new(StdMutex::new(pending_mutations_recv));
 
-        let inner_ctx = build_db_ctx_inner(self.on_connect, self.on_connect_error, self.on_disconnect);
+        let inner_ctx = build_db_ctx_inner(self.on_connect, self.on_connect_error, self.on_disconnect, self.on_transaction_applied);
         Ok(build_db_ctx(
             inner_ctx,
             raw_msg_send,
@@ -1095,6 +1102,21 @@ but you must call one of them, or else the connection will never progress.
     pub fn with_uri<E: std::fmt::Debug>(mut self, uri: impl TryInto<Uri, Error = E>) -> Self {
         let uri = uri.try_into().expect("Unable to parse supplied URI");
         self.uri = Some(uri);
+        self
+    }
+
+    /// Run after the cache and all row callbacks have processed one database
+    /// update. Initial subscription and unsubscribe updates also invoke this
+    /// callback. The context identifies the update through its event.
+    ///
+    /// Consumers can accumulate row changes in their table callbacks and
+    /// publish that complete batch here. Registering callbacks or invoking
+    /// reducers from this callback uses the normal deferred SDK mutations.
+    pub fn on_transaction_applied(
+        mut self,
+        callback: impl FnMut(&M::EventContext) + Send + 'static,
+    ) -> Self {
+        self.on_transaction_applied = Some(Box::new(callback));
         self
     }
 
@@ -1235,6 +1257,7 @@ fn build_db_ctx_inner<M: SpacetimeModule>(
     on_connect_cb: Option<OnConnectCallback<M>>,
     on_connect_error_cb: Option<OnConnectErrorCallback<M>>,
     on_disconnect_cb: Option<OnDisconnectCallback<M>>,
+    on_transaction_applied: Option<OnTransactionAppliedCallback<M>>,
 ) -> Arc<StdMutex<DbContextImplInner<M>>> {
     Arc::new(StdMutex::new(DbContextImplInner {
         #[cfg(not(feature = "browser"))]
@@ -1245,6 +1268,7 @@ fn build_db_ctx_inner<M: SpacetimeModule>(
         subscriptions: SubscriptionManager::default(),
 
         connection_lifecycle: ConnectionLifecycle::Connecting,
+        on_transaction_applied,
         on_connect: on_connect_cb,
         on_connect_error: on_connect_error_cb,
         on_disconnect: on_disconnect_cb,
