@@ -18,6 +18,8 @@
 //!
 //! This module is internal, and may incompatibly change without warning.
 
+#[cfg(not(feature = "browser"))]
+use crate::websocket::WsTls;
 use crate::{
     Event, ReducerEvent, Status,
     __codegen::{InternalError, Reducer},
@@ -902,6 +904,9 @@ pub struct DbConnectionBuilder<M: SpacetimeModule> {
     additional_logging_path: Option<PathBuf>,
 
     params: WsParams,
+
+    #[cfg(not(feature = "browser"))]
+    tls: WsTls,
 }
 
 /// This process's global connection ID, which will be attacked to all connections it makes.
@@ -960,6 +965,8 @@ impl<M: SpacetimeModule> DbConnectionBuilder<M> {
             on_disconnect: None,
             additional_logging_path: None,
             params: <_>::default(),
+            #[cfg(not(feature = "browser"))]
+            tls: <_>::default(),
         }
     }
 
@@ -1025,6 +1032,7 @@ but you must call one of them, or else the connection will never progress.
                 self.token.as_deref(),
                 connection_id_override,
                 self.params,
+                self.tls,
             ))
         })
         .map_err(|source| crate::Error::FailedToConnect {
@@ -1169,6 +1177,19 @@ but you must call one of them, or else the connection will never progress.
     /// If this method is not called, the server chooses the default.
     pub fn with_confirmed_reads(mut self, confirmed: bool) -> Self {
         self.params.confirmed = Some(confirmed);
+        self
+    }
+
+    /// Verify the server of a `wss://` connection with `config`, rustls's client
+    /// configuration: its roots, its crypto provider and its protocol versions.
+    ///
+    /// Without this, a connection verifies the server against the roots the
+    /// enabled root feature names (`rustls-tls-native-roots`: the platform's
+    /// trust store; `rustls-tls-webpki-roots`: Mozilla's root set), or, with
+    /// neither enabled, is refused before it dials.
+    #[cfg(all(not(feature = "browser"), feature = "rustls-tls"))]
+    pub fn with_rustls_config(mut self, config: Arc<rustls::ClientConfig>) -> Self {
+        self.tls.rustls_config = Some(config);
         self
     }
 

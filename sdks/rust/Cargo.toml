@@ -9,7 +9,27 @@ rust-version.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-default = []
+default = ["native-tls"]
+# The TLS backend of a native connection's WebSocket (`wss://`). A browser
+# connection uses the browser's own and reads none of these.
+#
+# `native-tls`: the platform's TLS library: SChannel on Windows,
+# Security.framework on macOS, OpenSSL everywhere else, Android included.
+native-tls = ["dep:native-tls", "tokio-tungstenite/native-tls"]
+# `rustls-tls`: rustls, verifying the server against the roots of the client
+# configuration `DbConnectionBuilder::with_rustls_config` supplies. A `wss://`
+# connection with no configuration and neither root feature below is refused
+# before it dials.
+rustls-tls = ["dep:rustls", "tokio-tungstenite/__rustls-tls"]
+# rustls with the platform's trust store (`rustls-native-certs`) as the roots
+# of a connection that supplies no configuration of its own. The configuration
+# a root feature builds takes rustls's process-default crypto provider: the
+# application enables one rustls provider feature (`ring`, `aws-lc-rs`) or
+# installs one.
+rustls-tls-native-roots = ["rustls-tls", "tokio-tungstenite/rustls-tls-native-roots"]
+# rustls with Mozilla's root set compiled in (`webpki-roots`) as the roots of
+# a connection that supplies no configuration of its own.
+rustls-tls-webpki-roots = ["rustls-tls", "tokio-tungstenite/rustls-tls-webpki-roots"]
 allow_loopback_http_for_tests = ["spacetimedb-testing/allow_loopback_http_for_tests"]
 browser = [
     "dep:getrandom",
@@ -67,10 +87,15 @@ zero_time = "0.1"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 home.workspace = true
 tokio.workspace = true
-tokio-tungstenite.workspace = true
+# The workspace's version, without the workspace's `native-tls` feature: the
+# TLS backend is this crate's `native-tls` / `rustls-tls*` features.
+tokio-tungstenite = { version = "0.27.0", features = ["url"] }
 # native-tls 0.2.17 fails to compile with Rust 1.93.0 due non-exhaustive
 # matching in upstream code. Pin until upstream ships a compatible release.
-native-tls = "=0.2.14"
+native-tls = { version = "=0.2.14", optional = true }
+# The client configuration type `DbConnectionBuilder::with_rustls_config`
+# takes: the rustls tokio-tungstenite connects with.
+rustls = { version = "0.23", default-features = false, features = ["std"], optional = true }
 
 [dev-dependencies]
 # for quickstart-chat and cursive-chat examples
