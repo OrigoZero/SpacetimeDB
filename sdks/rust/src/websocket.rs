@@ -25,9 +25,10 @@ use std::time::Duration;
 use thiserror::Error;
 #[cfg(not(feature = "browser"))]
 use tokio::{net::TcpStream, runtime, task::JoinHandle, time::Instant};
+#[cfg(all(not(feature = "browser"), not(any(feature = "native-tls", feature = "rustls-tls"))))]
+use tokio_tungstenite::connect_async_with_config;
 #[cfg(not(feature = "browser"))]
 use tokio_tungstenite::{
-    connect_async_with_config,
     tungstenite::client::IntoClientRequest,
     tungstenite::protocol::{Message as WebSocketMessage, WebSocketConfig},
     MaybeTlsStream, WebSocketStream,
@@ -129,6 +130,56 @@ pub enum WsError {
     #[cfg(feature = "browser")]
     #[error("Token verification error: {0}")]
     TokenVerification(String),
+
+    #[cfg(all(
+        not(feature = "browser"),
+        feature = "rustls-tls",
+        not(any(
+            feature = "native-tls",
+            feature = "rustls-tls-native-roots",
+            feature = "rustls-tls-webpki-roots"
+        ))
+    ))]
+    #[error(
+        "Cannot connect to {uri} over TLS: this build verifies servers with rustls against the roots of the \
+         client configuration `DbConnectionBuilder::with_rustls_config` supplies, and the connection supplied none"
+    )]
+    NoRustlsConfig { uri: Uri },
+}
+
+/// The TLS settings a native connection's WebSocket dials with.
+#[cfg(not(feature = "browser"))]
+#[derive(Clone, Default)]
+pub(crate) struct WsTls {
+    /// The rustls client configuration a `wss://` connection verifies the
+    /// server with, in place of the one the enabled root feature builds.
+    #[cfg(feature = "rustls-tls")]
+    pub(crate) rustls_config: Option<Arc<rustls::ClientConfig>>,
+}
+
+#[cfg(all(not(feature = "browser"), any(feature = "native-tls", feature = "rustls-tls")))]
+impl WsTls {
+    /// The connector tokio-tungstenite dials `uri` with: the supplied rustls
+    /// configuration, or `None` for the one the enabled backend builds itself.
+    fn connector(&self, uri: &Uri) -> Result<Option<tokio_tungstenite::Connector>, WsError> {
+        #[cfg(feature = "rustls-tls")]
+        if let Some(config) = &self.rustls_config {
+            return Ok(Some(tokio_tungstenite::Connector::Rustls(Arc::clone(config))));
+        }
+        #[cfg(all(
+            feature = "rustls-tls",
+            not(any(
+                feature = "native-tls",
+                feature = "rustls-tls-native-roots",
+                feature = "rustls-tls-webpki-roots"
+            ))
+        ))]
+        if uri.scheme_str() == Some("wss") {
+            return Err(WsError::NoRustlsConfig { uri: uri.clone() });
+        }
+        let _ = uri;
+        Ok(None)
+    }
 }
 
 pub(crate) struct WsConnection {
@@ -355,25 +406,32 @@ impl WsConnection {
         token: Option<&str>,
         connection_id: Option<ConnectionId>,
         params: WsParams,
+        tls: WsTls,
     ) -> Result<Self, WsError> {
         let req = make_request(host, db_name, token, connection_id, params)?;
 
         // Grab the URI for error-reporting.
         let uri = req.uri().clone();
 
-        let (sock, _): (WebSocketStream<MaybeTlsStream<TcpStream>>, _) = connect_async_with_config(
-            req,
-            // TODO(kim): In order to be able to replicate module WASM blobs,
-            // `cloud-next` cannot have message / frame size limits. That's
-            // obviously a bad default for all other clients, though.
-            Some(WebSocketConfig::default().max_frame_size(None).max_message_size(None)),
-            false,
-        )
-        .await
-        .map_err(|source| WsError::Tungstenite {
-            uri,
-            source: Arc::new(source),
-        })?;
+        // TODO(kim): In order to be able to replicate module WASM blobs,
+        // `cloud-next` cannot have message / frame size limits. That's
+        // obviously a bad default for all other clients, though.
+        let config = Some(WebSocketConfig::default().max_frame_size(None).max_message_size(None));
+        #[cfg(any(feature = "native-tls", feature = "rustls-tls"))]
+        let connected = {
+            let connector = tls.connector(&uri)?;
+            tokio_tungstenite::connect_async_tls_with_config(req, config, false, connector).await
+        };
+        #[cfg(not(any(feature = "native-tls", feature = "rustls-tls")))]
+        let connected = {
+            let WsTls {} = tls;
+            connect_async_with_config(req, config, false).await
+        };
+        let (sock, _): (WebSocketStream<MaybeTlsStream<TcpStream>>, _) =
+            connected.map_err(|source| WsError::Tungstenite {
+                uri,
+                source: Arc::new(source),
+            })?;
         Ok(WsConnection {
             db_name: db_name.into(),
             sock,
